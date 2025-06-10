@@ -112,14 +112,22 @@ class QuizApp:
         # --- Middle Frame (保持不变) ---
         self.question_frame = tk.LabelFrame(master, text="题目区域", padx=10, pady=10)
         self.question_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.question_header_label = tk.Label(self.question_frame, text="", justify=tk.LEFT, wraplength=750, font=self.QUESTION_FONT)
+        self.question_header_label = tk.Label(self.question_frame, text="", justify=tk.LEFT, wraplength=1, font=self.QUESTION_FONT)
         self.question_header_label.pack(anchor="w")
-        self.question_text_label = tk.Label(self.question_frame, text="请先导入题库或加载已有进度", justify=tk.LEFT, wraplength=750, font=self.QUESTION_FONT)
+        self.question_text_label = tk.Label(self.question_frame, text="请先导入题库或加载已有进度", justify=tk.LEFT, wraplength=1, font=self.QUESTION_FONT)
         self.question_text_label.pack(anchor="w", pady=5)
         self.options_frame = tk.Frame(self.question_frame) 
         self.options_frame.pack(anchor="w", fill=tk.X, pady=5)
-        self.answer_display_label = tk.Label(self.question_frame, text="", justify=tk.LEFT, wraplength=750, fg="blue", font=self.ANSWER_FONT)
+        self.answer_display_label = tk.Label(self.question_frame, text="", justify=tk.LEFT, wraplength=1, fg="blue", font=self.ANSWER_FONT)
         self.answer_display_label.pack(anchor="w", pady=10)
+
+        # 绑定 <Configure> 事件到 self.question_frame
+        # 当 self.question_frame 的大小改变时，调用 self.update_wraplengths
+        self.question_frame.bind("<Configure>", self.update_wraplengths)
+        # 也为 options_frame 绑定，因为选项在其内部
+        self.options_frame.bind("<Configure>", self.update_wraplengths_for_options)
+        # 尝试在UI稳定后首次调用更新，确保初始wraplength正确
+        self.master.after(100, self.initial_wraplength_update)
         
         # --- Bottom Frame for Controls (保持不变) ---
         controls_frame = tk.Frame(master, pady=10)
@@ -132,19 +140,229 @@ class QuizApp:
         # --- Answered Questions Frame (保持不变) ---
         answered_frame = tk.LabelFrame(master, text="已答题目列表", padx=10, pady=10)
         answered_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        self.answered_listbox = tk.Listbox(answered_frame, selectmode=tk.EXTENDED, width=80, height=10)
+        answered_buttons_frame = tk.Frame(answered_frame)
+        answered_buttons_frame.pack(fill=tk.X, pady=5)
+
+        self.btn_move_back = tk.Button(answered_buttons_frame, text="移回未答", command=self.move_to_unanswered, state=tk.DISABLED)
+        self.btn_move_back.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X) # expand 和 fill
+
+        self.btn_delete_selected = tk.Button(answered_buttons_frame, text="删除选中", command=self.delete_selected_questions, state=tk.DISABLED, bg="salmon")
+        self.btn_delete_selected.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X) # expand 和 fill
+        # 创建水平滚动条
+        answered_xscrollbar = tk.Scrollbar(answered_frame, orient=tk.HORIZONTAL)
+        answered_xscrollbar.pack(side=tk.BOTTOM, fill=tk.X) # 放在 Listbox 下方
+        # 创建 Listbox，移除固定的 width 或设置一个合理的初始值
+        self.answered_listbox = tk.Listbox(answered_frame, 
+                                            selectmode=tk.EXTENDED, 
+                                            width=80, # 可以保留或移除，或设置更小的值配合滚动条
+                                            yscrollcommand=None, # 先置空，后面一起配置
+                                            xscrollcommand=answered_xscrollbar.set) # 关联水平滚动条
         self.answered_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         answered_scrollbar = tk.Scrollbar(answered_frame, orient=tk.VERTICAL, command=self.answered_listbox.yview)
         answered_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.answered_listbox.config(yscrollcommand=answered_scrollbar.set)
-        self.btn_move_back = tk.Button(answered_frame, text="移回未答列表", command=self.move_to_unanswered, state=tk.DISABLED)
-        self.btn_move_back.pack(pady=5)
+        # 配置水平滚动条的 command
+        answered_xscrollbar.config(command=self.answered_listbox.xview)
+        self.answered_listbox.bind("<Double-Button-1>", self.preview_answered_question)
+        # 在 __init__ 中，为 answered_listbox 绑定选择变化事件
+        self.answered_listbox.bind("<<ListboxSelect>>", self.on_answered_listbox_select)
+        # self.btn_move_back = tk.Button(answered_frame, text="移回未答列表", command=self.move_to_unanswered, state=tk.DISABLED)
+        # self.btn_move_back.pack(pady=5)
 
         # --- 自动加载进度 ---
         self.load_progress() 
 
         # --- 程序退出时自动保存 ---
         master.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    # 在 QuizApp 类中添加新方法：
+    def delete_selected_questions(self):
+        selected_indices = self.answered_listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning("删除题目", "请先在“已答题目列表”中选择要删除的题目。")
+            return
+
+        # 从后往前删除，以避免索引混乱
+        # 确认删除
+        if not messagebox.askyesno("确认删除", f"确定要永久删除选中的 {len(selected_indices)} 道题目吗？\n此操作也会从总题库中移除它们，并保存进度。"):
+            return
+
+        deleted_count = 0
+        questions_to_remove_from_all = []
+
+        for i in sorted(selected_indices, reverse=True):
+            try:
+                # 1. 从 answered_questions 移除并获取对象
+                question_obj_to_delete = self.answered_questions.pop(i)
+                
+                # 2. 从 Listbox 中移除
+                self.answered_listbox.delete(i)
+                
+                # 3. 准备从 all_questions 中移除 (先收集，避免在循环中修改 all_questions)
+                questions_to_remove_from_all.append(question_obj_to_delete)
+                
+                deleted_count += 1
+            except IndexError:
+                print(f"删除已答题目时索引错误: {i}")
+
+        # 4. 从 all_questions 和 unanswered_questions 中移除
+        if questions_to_remove_from_all:
+            # 使用 set 操作可以提高效率，如果 Question 对象是可哈希的
+            # 或者直接列表推导式移除
+            # 为了确保是同一个对象，我们比较对象id（或者实现__eq__和__hash__）
+            # 简单起见，如果 Question 对象直接存的是引用，以下方式可行
+            
+            temp_all_questions = []
+            for q_all in self.all_questions:
+                is_to_remove = False
+                for q_remove in questions_to_remove_from_all:
+                    if q_all is q_remove: # 比较对象身份
+                        is_to_remove = True
+                        break
+                if not is_to_remove:
+                    temp_all_questions.append(q_all)
+            self.all_questions = temp_all_questions
+
+            temp_unanswered_questions = []
+            for q_unans in self.unanswered_questions:
+                is_to_remove = False
+                for q_remove in questions_to_remove_from_all:
+                    if q_unans is q_remove: # 比较对象身份
+                        is_to_remove = True
+                        break
+                if not is_to_remove:
+                    temp_unanswered_questions.append(q_unans)
+            self.unanswered_questions = temp_unanswered_questions
+        
+        if deleted_count > 0:
+            self.update_stats()
+            messagebox.showinfo("删除成功", f"成功删除了 {deleted_count} 道题目。")
+            # 删除后自动保存进度
+            self.save_progress(silent=True) 
+        else:
+            messagebox.showinfo("删除", "没有题目被删除（可能出现内部错误）。")
+
+    def on_answered_listbox_select(self, event):
+        """当已答列表选择变化时，更新按钮状态"""
+        self.update_stats() # 调用 update_stats 来启用/禁用按钮
+
+    # 在 QuizApp 类中添加新方法：
+    def preview_answered_question(self, event):
+        selection_indices = self.answered_listbox.curselection()
+        if not selection_indices:
+            return # 没有选中项
+
+        selected_idx = selection_indices[0] # 获取第一个选中项的索引
+        
+        # 从 self.answered_questions 中获取对应的 Question 对象
+        # 假设 self.answered_listbox 中的顺序与 self.answered_questions 一致
+        if selected_idx < len(self.answered_questions):
+            question_obj = self.answered_questions[selected_idx]
+        else:
+            messagebox.showerror("错误", "无法找到对应的题目数据。")
+            return
+
+        # 创建一个新的顶层窗口 (Toplevel) 来显示预览
+        preview_win = tk.Toplevel(self.master)
+        preview_win.title(f"题目预览 - {question_obj.q_type} (原序 {question_obj.original_doc_order + 1})")
+        preview_win.geometry("600x400") # 可以根据内容调整大小
+        preview_win.transient(self.master) # 使其显示在主窗口之上
+        preview_win.grab_set() # 模态化，阻止与主窗口交互，直到此窗口关闭
+
+        # 使用 ScrolledText 来显示可能较长的内容
+        text_area = scrolledtext.ScrolledText(preview_win, wrap=tk.WORD, font=("Arial", 12), padx=10, pady=10)
+        text_area.pack(fill=tk.BOTH, expand=True)
+
+        # 构建显示内容
+        content = []
+        content.append(f"题型: {question_obj.q_type}")
+        content.append(f"原序号: {question_obj.original_doc_order + 1}")
+        content.append("-" * 30)
+        content.append(f"题目:\n{question_obj.get_display_text()}\n") # get_display_text 包含原始序号和题干
+
+        if question_obj.q_type in ["单选题", "多选题"]:
+            content.append("选项:")
+            for letter, opt_text in sorted(question_obj.options.items()):
+                content.append(f"  {letter}. {opt_text}")
+            content.append("\n")
+        elif question_obj.q_type == "判断题":
+            content.append("选项:\n  A. 是 (正确)\n  B. 否 (错误)\n")
+            
+
+        content.append("正确答案:")
+        if question_obj.q_type == "单选题":
+            correct_ans_display = f"{question_obj.answer}. {question_obj.options.get(question_obj.answer, '')}"
+        elif question_obj.q_type == "多选题":
+            ans_list = question_obj.answer if isinstance(question_obj.answer, list) else []
+            correct_ans_display = "".join(sorted(ans_list))
+            for letter in sorted(ans_list):
+                correct_ans_display += f"\n  {letter}. {question_obj.options.get(letter, '')}"
+        elif question_obj.q_type == "判断题":
+            display_options = {"A": "是 (正确)", "B": "否 (错误)"}
+            correct_ans_display = f"{question_obj.answer}. {display_options.get(question_obj.answer, '')}"
+        elif question_obj.q_type == "填空题":
+            ans_list = question_obj.answer if isinstance(question_obj.answer, list) else []
+            correct_ans_display = " | ".join(ans_list)
+        else:
+            correct_ans_display = str(question_obj.answer_raw) # Fallback
+
+        content.append(correct_ans_display)
+
+        text_area.insert(tk.END, "\n".join(content))
+        text_area.config(state=tk.DISABLED) # 设置为只读
+
+        # 添加关闭按钮
+        close_button = tk.Button(preview_win, text="关闭", command=preview_win.destroy, font=("Arial", 10))
+        close_button.pack(pady=10)
+
+    def initial_wraplength_update(self):
+        """在UI稳定后首次更新wraplengths"""
+        # 确保组件已经获得了实际宽度
+        if self.question_frame.winfo_width() > 1: # 确保宽度有效
+            self.update_wraplengths(None) # 传递 None 事件对象
+        if self.options_frame.winfo_width() > 1:
+            self.update_wraplengths_for_options(None)
+
+    def update_wraplengths_for_options(self, event):
+        """当 options_frame 大小改变时，更新其内部选项的 wraplength"""
+        options_frame_width = self.options_frame.winfo_width()
+        # 选项文本前有 "A. " 等，所以 wraplength 通常比 frame 宽度小一些
+        option_wraplength = max(1, options_frame_width - 30) # 减去一些缓冲和标记宽度
+
+        # 遍历 self.options_frame 中的 Radiobutton 和 Checkbutton
+        # self.user_answer_widgets 存储了这些动态创建的组件
+        for widget in self.user_answer_widgets:
+            if widget.winfo_exists() and isinstance(widget, (tk.Radiobutton, tk.Checkbutton)):
+                try:
+                    widget.config(wraplength=option_wraplength)
+                except tk.TclError:
+                    # 有时在组件正在销毁或尚未完全创建时调用config会出错
+                    pass 
+            # 注意：填空题的 Entry 组件不需要 wraplength
+
+    def update_wraplengths(self, event):
+        """当 question_frame 大小改变时，更新其内部 Label 的 wraplength"""
+        # event 参数是Tkinter传递的事件对象，可能为None（如果手动调用）
+        # 我们需要 question_frame 的当前内部宽度
+        # winfo_width() 获取的是组件的总宽度，包括边框和内边距
+        # 我们需要的是可用于文本的区域宽度
+        
+        # 简单的估算：Frame宽度减去一些边距
+        # padx 在 LabelFrame 定义时是10，左右各10，所以减20
+        # 但Label本身可能也有自己的内部边距或特性，所以再减一点作为缓冲
+        frame_width = self.question_frame.winfo_width()
+        new_wraplength = max(1, frame_width - 25) # 减去 LabelFrame 的 padx 和一些缓冲, 最小为1
+
+        if hasattr(self, 'question_header_label') and self.question_header_label.winfo_exists():
+            self.question_header_label.config(wraplength=new_wraplength)
+        if hasattr(self, 'question_text_label') and self.question_text_label.winfo_exists():
+            self.question_text_label.config(wraplength=new_wraplength)
+        if hasattr(self, 'answer_display_label') and self.answer_display_label.winfo_exists():
+            self.answer_display_label.config(wraplength=new_wraplength)
+        
+        # 由于选项的 wraplength 依赖于 options_frame，让 options_frame 的事件处理器负责
+        # 或者在这里也触发一次 options_frame 的更新 (如果 options_frame 宽度变化不频繁)
+        # self.update_wraplengths_for_options(None) # 如果需要
 
     def on_closing(self):
         if messagebox.askokcancel("退出", "确定要退出吗？将会自动保存当前进度。"):
@@ -194,7 +412,7 @@ class QuizApp:
             # 恢复UI状态
             self.answered_listbox.delete(0, tk.END)
             for q in self.answered_questions:
-                q_preview = f"{q.q_type} (原序 {q.original_doc_order + 1}) {q.text[:40]}..."
+                q_preview = f"{q.q_type} (原序 {q.original_doc_order + 1}) {q.text}"
                 self.answered_listbox.insert(tk.END, q_preview)
             
             self.update_stats()
@@ -377,6 +595,8 @@ class QuizApp:
         self.btn_move_back.config(state=tk.NORMAL if self.answered_questions else tk.DISABLED)
         # 如果没有题目，禁用保存按钮可能也是个好主意
         self.btn_save_progress.config(state=tk.NORMAL if self.all_questions else tk.DISABLED)
+        self.btn_move_back.config(state=tk.NORMAL if self.answered_listbox.curselection() or self.answered_questions else tk.DISABLED)
+        self.btn_delete_selected.config(state=tk.NORMAL if self.answered_listbox.curselection() or self.answered_questions else tk.DISABLED)
 
 
     def clear_question_display(self):
@@ -395,7 +615,15 @@ class QuizApp:
             messagebox.showinfo("提示", "所有题目都已作答完毕！")
             self.clear_question_display()
             return
-
+        
+        # 在创建选项之前，获取一次 options_frame 的当前宽度来设置初始 wraplength
+        # 这有助于避免初次显示时文本挤在一起然后才调整
+        current_options_frame_width = self.options_frame.winfo_width()
+        if current_options_frame_width <= 1 : # 如果宽度还未确定，给一个默认值
+            current_options_frame_width = self.question_frame.winfo_width() # 尝试用父容器估算
+        
+        initial_option_wraplength = max(1, current_options_frame_width - 30)
+        
         self.current_question_data = random.choice(self.unanswered_questions)
         q = self.current_question_data 
 
@@ -446,7 +674,7 @@ class QuizApp:
             for letter, opt_text in options_to_display.items():
                 rb = tk.Radiobutton(self.options_frame, text=f"{letter}. {opt_text}", 
                                     variable=self.var_choice, value=letter, 
-                                    wraplength=700, justify=tk.LEFT, 
+                                    wraplength=initial_option_wraplength, justify=tk.LEFT, 
                                     font=self.OPTION_FONT) # <--- 修改字体
                 # rb = tk.Radiobutton(self.options_frame, text=f"{letter}. {opt_text}", variable=self.var_choice, value=letter, wraplength=700, justify=tk.LEFT)
                 rb.pack(anchor="w")
@@ -458,7 +686,7 @@ class QuizApp:
             for letter, opt_text in q.options.items():
                 var = tk.BooleanVar()
                 cb = tk.Checkbutton(self.options_frame, text=f"{letter}. {opt_text}", 
-                                     variable=var, wraplength=700, 
+                                     variable=var, wraplength=initial_option_wraplength, 
                                      justify=tk.LEFT, 
                                      font=self.OPTION_FONT)
                 # cb = tk.Checkbutton(self.options_frame, text=f"{letter}. {opt_text}", variable=var, wraplength=700, justify=tk.LEFT)
@@ -477,50 +705,55 @@ class QuizApp:
         if not self.current_question_data:
             return
 
-        q = self.current_question_data 
+        q_being_processed = self.current_question_data # 使用一个明确的变量名
         correct_answer_str = ""
         user_answer_str = ""
         
-        if q.q_type == "单选题":
-            correct_answer_str = f"正确答案: {q.answer or '未提供'}. {q.options.get(q.answer, '') if q.answer else ''}"
+        # --- 构建 correct_answer_str 和 user_answer_str (这部分逻辑保持不变) ---
+        if q_being_processed.q_type == "单选题":
+            correct_answer_str = f"正确答案: {q_being_processed.answer or '未提供'}. {q_being_processed.options.get(q_being_processed.answer, '') if q_being_processed.answer else ''}"
             user_answer_val = self.var_choice.get()
-            user_answer_str = f"您的选择: {user_answer_val or '未选择'}. {q.options.get(user_answer_val, '') if user_answer_val else ''}"
+            user_answer_str = f"您的选择: {user_answer_val or '未选择'}. {q_being_processed.options.get(user_answer_val, '') if user_answer_val else ''}"
         
-        elif q.q_type == "多选题":
-            ans_list = q.answer if isinstance(q.answer, list) else []
+        elif q_being_processed.q_type == "多选题":
+            ans_list = q_being_processed.answer if isinstance(q_being_processed.answer, list) else []
             sorted_ans = sorted(ans_list)
             correct_answer_str = f"正确答案: {''.join(sorted_ans) or '未提供'}\n"
             for ans_letter in sorted_ans:
-                 correct_answer_str += f"  {ans_letter}. {q.options.get(ans_letter, '')}\n"
+                 correct_answer_str += f"  {ans_letter}. {q_being_processed.options.get(ans_letter, '')}\n"
             
             user_choices = sorted([letter for letter, var in self.vars_multi_choice.items() if var.get()])
             user_answer_str = f"您的选择: {''.join(user_choices) or '未选择'}\n"
             for choice_letter in user_choices:
-                 user_answer_str += f"  {choice_letter}. {q.options.get(choice_letter, '')}\n"
+                 user_answer_str += f"  {choice_letter}. {q_being_processed.options.get(choice_letter, '')}\n"
 
-        elif q.q_type == "判断题":
+        elif q_being_processed.q_type == "判断题":
             display_options = {"A": "是 (正确)", "B": "否 (错误)"}
-            correct_answer_str = f"正确答案: {q.answer or '未提供'}. {display_options.get(q.answer, '(答案解析可能不匹配)') if q.answer else ''}"
+            correct_answer_str = f"正确答案: {q_being_processed.answer or '未提供'}. {display_options.get(q_being_processed.answer, '(答案解析可能不匹配)') if q_being_processed.answer else ''}"
             user_answer_val = self.var_choice.get()
             user_answer_str = f"您的选择: {user_answer_val or '未选择'}. {display_options.get(user_answer_val, '') if user_answer_val else ''}"
 
-        elif q.q_type == "填空题":
-            ans_list = q.answer if isinstance(q.answer, list) else []
+        elif q_being_processed.q_type == "填空题":
+            ans_list = q_being_processed.answer if isinstance(q_being_processed.answer, list) else []
             correct_answer_str = f"正确答案: {' | '.join(ans_list or ['未提供'])}"
             user_fills = [widget.get() for widget in self.user_answer_widgets if isinstance(widget, tk.Entry)]
             user_answer_str = f"您的填写: {' | '.join(user_fills) or '未填写'}"
         else:
             correct_answer_str = "正确答案: (未知题型)"
             user_answer_str = "您的作答: (未知题型)"
+        # --- 结束构建答案字符串 ---
 
         self.answer_display_label.config(text=f"{user_answer_str}\n{correct_answer_str}")
         
-        if self.current_question_data in self.unanswered_questions: # 确保它确实还在未答列表
-            self.unanswered_questions.remove(self.current_question_data)
-            self.answered_questions.append(self.current_question_data)
+        if q_being_processed in self.unanswered_questions: 
+            self.unanswered_questions.remove(q_being_processed)
             
-            q_preview = f"{q.q_type} (原序 {q.original_doc_order + 1}) {q.text[:40]}..."
-            self.answered_listbox.insert(tk.END, q_preview)
+            # --- 修改核心：将新完成的题目插入到开头 ---
+            self.answered_questions.insert(0, q_being_processed) # 插入到数据列表的开头
+            
+            q_preview = f"{q_being_processed.q_type} (原序 {q_being_processed.original_doc_order + 1}) {q_being_processed.text}"
+            self.answered_listbox.insert(0, q_preview) # 插入到 Listbox 显示的开头
+            # --- 核心修改结束 ---
             
         self.update_stats()
         self.btn_show_answer.config(state=tk.DISABLED) 
